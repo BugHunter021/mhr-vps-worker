@@ -1,7 +1,10 @@
 // Google Apps Script File
 
+// Replace with your Secret
 const AUTH_KEY = "STRONG_SECRET_KEY";
-const WORKER_URL = "http://Your_IP:8081"; // Replace with server IP
+// Replace with your VPS IP
+const VPS_IP = "YOUR_VPS_IP"; 
+const WORKER_URL = "http://" + VPS_IP + ":8081";
 
 const SKIP_HEADERS = {
   host: 1, connection: 1, "content-length": 1,
