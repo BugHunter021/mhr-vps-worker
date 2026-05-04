@@ -5,14 +5,14 @@ const url = require('url');
 
 dns.setDefaultResultOrder('ipv4first');
 
-// ========== کانفیگ upstream proxy ==========
+// ========== کانفیگ upstream proxy ==========  v1.2
 const UPSTREAM_PROXY = 'http://127.0.0.1:8087'; // آدرس و پورت Warp
 const USE_UPSTREAM = true; // اگر false باشه مستقیم متصل میشه
 // ===========================================
 
 const BAD_HEADERS = [
   'host', 'x-forwarded-for', 'x-real-ip', 'x-forwarded-proto',
-  'cf-connecting-ip', 'connection', 'keep-alive'
+  'cf-connecting-ip', 'connection', 'keep-alive', 'proxy-connection'
 ];
 
 const SLOW_SITES = [
@@ -33,21 +33,38 @@ const SLOW_SITES = [
 const TIMEOUT_SLOW_MS = 55000;
 const TIMEOUT_FAST_MS = 20000;
 
-// Agent ها
+// تابع ساخت agent با proxy
+function createAgent(proxyUrl, isHttps) {
+  if (!proxyUrl) return null;
+  
+  const proxyOptions = url.parse(proxyUrl);
+  
+  if (isHttps) {
+    // برای HTTPS از tunnel-agent استفاده می‌کنیم
+    const tunnel = require('tunnel');
+    return tunnel.httpsOverHttp({
+      proxy: {
+        host: proxyOptions.hostname,
+        port: parseInt(proxyOptions.port),
+      },
+      rejectUnauthorized: false
+    });
+  } else {
+    // برای HTTP
+    return new http.Agent({
+      keepAlive: true,
+      proxy: proxyOptions
+    });
+  }
+}
+
 let httpAgent, httpsAgent;
 
 if (USE_UPSTREAM) {
-  // روش ساده تر: استفاده از محیط متغیرها
-  process.env.HTTP_PROXY = UPSTREAM_PROXY;
-  process.env.HTTPS_PROXY = UPSTREAM_PROXY;
-  
-  // استفاده از agent ساده با proxy
-  const { HttpsProxyAgent } = require('https-proxy-agent');
-  
+  // ساخت agent های مجزا برای HTTP و HTTPS
+  httpsAgent = createAgent(UPSTREAM_PROXY, true);
   httpAgent = new http.Agent({ keepAlive: true });
-  httpsAgent = new HttpsProxyAgent(UPSTREAM_PROXY);
-  
-  console.log(`✅ Using proxy: ${UPSTREAM_PROXY}`);
+  console.log(`✅ Using upstream proxy: ${UPSTREAM_PROXY}`);
 } else {
   const agentOptions = { rejectUnauthorized: false, keepAlive: true };
   httpAgent = new http.Agent(agentOptions);
@@ -75,6 +92,10 @@ function isSlowHost(hostname) {
 const server = http.createServer((req, res) => {
   let bodyParts = [];
   
+  req.on('error', (err) => {
+    console.error('Request error:', err);
+  });
+  
   req.on('data', chunk => bodyParts.push(chunk));
   req.on('end', () => {
     let isResponded = false;
@@ -88,22 +109,38 @@ const server = http.createServer((req, res) => {
     
     try {
       const bodyStr = Buffer.concat(bodyParts).toString();
-      if (!bodyStr) return sendResponse(500, {}, Buffer.from("empty").toString('base64'));
+      if (!bodyStr) {
+        return sendResponse(400, {}, Buffer.from("empty body").toString('base64'));
+      }
       
       const data = JSON.parse(bodyStr);
-      if (!data.u) return sendResponse(500, {}, Buffer.from("no url").toString('base64'));
+      if (!data.u) {
+        return sendResponse(400, {}, Buffer.from("no url provided").toString('base64'));
+      }
       
       const targetUrl = new URL(data.u);
       const isHttps = targetUrl.protocol === 'https:';
       const slow = isSlowHost(targetUrl.hostname);
       
+      // ساخت options درخواست
       const options = {
         method: data.m || 'GET',
         headers: {},
-        timeout: slow ? TIMEOUT_SLOW_MS : TIMEOUT_FAST_MS
+        timeout: slow ? TIMEOUT_SLOW_MS : TIMEOUT_FAST_MS,
+        rejectUnauthorized: false
       };
       
-      // تنظیم هدرها
+      // تنظیم agent مناسب
+      if (USE_UPSTREAM && isHttps && httpsAgent) {
+        options.agent = httpsAgent;
+      } else if (USE_UPSTREAM && !isHttps) {
+        // برای HTTP از agent پیشفرض استفاده می‌کنیم
+        options.agent = httpAgent;
+      } else if (!USE_UPSTREAM) {
+        options.agent = isHttps ? httpsAgent : httpAgent;
+      }
+      
+      // اضافه کردن هدرهای درخواست
       if (data.h) {
         for (const [key, value] of Object.entries(data.h)) {
           const lowerKey = key.toLowerCase();
@@ -113,12 +150,10 @@ const server = http.createServer((req, res) => {
         }
       }
       
-      // انتخاب agent مناسب
-      if (USE_UPSTREAM && isHttps) {
-        options.agent = httpsAgent;
-      } else if (!USE_UPSTREAM) {
-        options.agent = isHttps ? httpsAgent : httpAgent;
-      }
+      // هدر host را تنظیم کن
+      options.headers.host = targetUrl.host;
+      
+      console.log(`📤 ${options.method} ${targetUrl.href} (slow: ${slow})`);
       
       const protocol = isHttps ? https : http;
       const proxyReq = protocol.request(targetUrl, options, (proxyRes) => {
@@ -133,6 +168,7 @@ const server = http.createServer((req, res) => {
         proxyRes.on('data', chunk => chunks.push(chunk));
         
         proxyRes.on('end', () => {
+          console.log(`📥 Response ${proxyRes.statusCode} for ${targetUrl.href}`);
           sendResponse(
             proxyRes.statusCode,
             responseHeaders,
@@ -142,17 +178,20 @@ const server = http.createServer((req, res) => {
       });
       
       proxyReq.on('timeout', () => {
+        console.error(`⏰ Timeout for ${targetUrl.href}`);
         proxyReq.destroy();
         sendResponse(504, {}, Buffer.from("Target Timeout").toString('base64'));
       });
       
       proxyReq.on('error', (err) => {
-        console.error('Proxy error:', err.message);
+        console.error(`❌ Proxy error for ${targetUrl.href}:`, err.message);
         sendResponse(502, {}, Buffer.from("Relay Error: " + err.message).toString('base64'));
       });
       
       if (data.b && !['GET', 'HEAD'].includes(options.method)) {
-        proxyReq.write(Buffer.from(data.b, 'base64'));
+        const bodyBuffer = Buffer.from(data.b, 'base64');
+        console.log(`📦 Sending body: ${bodyBuffer.length} bytes`);
+        proxyReq.write(bodyBuffer);
       }
       
       proxyReq.end();
@@ -167,4 +206,5 @@ const server = http.createServer((req, res) => {
 server.listen(8081, '0.0.0.0', () => {
   console.log(`🚀 Relay server running on port 8081`);
   console.log(`📡 Upstream proxy: ${USE_UPSTREAM ? UPSTREAM_PROXY : 'Disabled'}`);
+  console.log(`🔧 DNS order: ipv4first`);
 });
