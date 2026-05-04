@@ -33,20 +33,26 @@ const SLOW_SITES = [
 const TIMEOUT_SLOW_MS = 55000;
 const TIMEOUT_FAST_MS = 20000;
 
-// Agent ها با پشتیبانی از proxy
+// Agent ها
 let httpAgent, httpsAgent;
 
 if (USE_UPSTREAM) {
-  const proxyUrl = new url.URL(UPSTREAM_PROXY);
-  const HttpsProxyAgent = require('https-proxy-agent');
-  const HttpProxyAgent = require('http-proxy-agent');
+  // روش ساده تر: استفاده از محیط متغیرها
+  process.env.HTTP_PROXY = UPSTREAM_PROXY;
+  process.env.HTTPS_PROXY = UPSTREAM_PROXY;
   
-  httpAgent = new HttpProxyAgent.HttpProxyAgent(proxyUrl);
-  httpsAgent = new HttpsProxyAgent.HttpsProxyAgent(proxyUrl);
+  // استفاده از agent ساده با proxy
+  const { HttpsProxyAgent } = require('https-proxy-agent');
+  
+  httpAgent = new http.Agent({ keepAlive: true });
+  httpsAgent = new HttpsProxyAgent(UPSTREAM_PROXY);
+  
+  console.log(`✅ Using proxy: ${UPSTREAM_PROXY}`);
 } else {
   const agentOptions = { rejectUnauthorized: false, keepAlive: true };
   httpAgent = new http.Agent(agentOptions);
   httpsAgent = new https.Agent(agentOptions);
+  console.log(`✅ Direct connection (no proxy)`);
 }
 
 function isSlowHost(hostname) {
@@ -94,7 +100,6 @@ const server = http.createServer((req, res) => {
       const options = {
         method: data.m || 'GET',
         headers: {},
-        agent: isHttps ? httpsAgent : httpAgent,
         timeout: slow ? TIMEOUT_SLOW_MS : TIMEOUT_FAST_MS
       };
       
@@ -108,9 +113,11 @@ const server = http.createServer((req, res) => {
         }
       }
       
-      // اضافه کردن هدرهای proxy (برای شناسایی در Warp)
-      if (USE_UPSTREAM) {
-        options.headers['X-Forwarded-For'] = req.socket.remoteAddress;
+      // انتخاب agent مناسب
+      if (USE_UPSTREAM && isHttps) {
+        options.agent = httpsAgent;
+      } else if (!USE_UPSTREAM) {
+        options.agent = isHttps ? httpsAgent : httpAgent;
       }
       
       const protocol = isHttps ? https : http;
@@ -139,7 +146,8 @@ const server = http.createServer((req, res) => {
         sendResponse(504, {}, Buffer.from("Target Timeout").toString('base64'));
       });
       
-      proxyReq.on('error', err => {
+      proxyReq.on('error', (err) => {
+        console.error('Proxy error:', err.message);
         sendResponse(502, {}, Buffer.from("Relay Error: " + err.message).toString('base64'));
       });
       
@@ -150,16 +158,13 @@ const server = http.createServer((req, res) => {
       proxyReq.end();
       
     } catch (err) {
+      console.error('Server error:', err.message);
       sendResponse(500, {}, Buffer.from("Relay logic error: " + err.message).toString('base64'));
     }
   });
 });
 
 server.listen(8081, '0.0.0.0', () => {
-  console.log(`Upstream Proxy relay running on port 8081`);
-  if (USE_UPSTREAM) {
-    console.log(`Using upstream proxy: ${UPSTREAM_PROXY}`);
-  } else {
-    console.log(`Direct connection (no proxy)`);
-  }
+  console.log(`🚀 Relay server running on port 8081`);
+  console.log(`📡 Upstream proxy: ${USE_UPSTREAM ? UPSTREAM_PROXY : 'Disabled'}`);
 });
